@@ -28,6 +28,8 @@ int main(int argc, char **argv) {
   chrono::steady_clock::time_point t1 = chrono::steady_clock::now();
   detector->detect(img_1, keypoints_1);
   detector->detect(img_2, keypoints_2);
+  cout << "keypoints in first image: " << keypoints_1.size()
+       << ", in second image: " << keypoints_2.size() << endl;
 
   //-- 第二步:根据角点位置计算 BRIEF 描述子
   descriptor->compute(img_1, keypoints_1, descriptors_1);

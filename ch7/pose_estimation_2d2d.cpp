@@ -147,7 +147,8 @@ void pose_estimation_2d2d(std::vector<KeyPoint> keypoints_1,
   Point2d principal_point(325.1, 249.7);  //相机光心, TUM dataset标定值
   double focal_length = 521;      //相机焦距, TUM dataset标定值
   Mat essential_matrix;
-  essential_matrix = findEssentialMat(points1, points2, focal_length, principal_point);
+  // essential_matrix = findEssentialMat(points1, points2, focal_length, principal_point);
+  essential_matrix = findEssentialMat(points1, points2, K);// 上一行默认方形像素，xy方向比例一样，实际最好还是用完整K
   cout << "essential_matrix is " << endl << essential_matrix << endl;
 
   //-- 计算单应矩阵
@@ -157,7 +158,17 @@ void pose_estimation_2d2d(std::vector<KeyPoint> keypoints_1,
   cout << "homography_matrix is " << endl << homography_matrix << endl;
 
   //-- 从本质矩阵中恢复旋转和平移信息.
-  // 此函数仅在Opencv3中提供
+  // 下面这种传 focal_length + principal_point 的重载在 OpenCV 4 中依然可用（内部按 fx=fy=f、skew=0 构造 K），
+  // 但更推荐的 OpenCV 4 用法是直接传完整内参矩阵 K，并且函数会返回内点个数、可选输出 mask：
+  //
+  //   Mat K = (Mat_<double>(3, 3) << 520.9, 0, 325.1, 0, 521.0, 249.7, 0, 0, 1);  // 完整内参
+  //   Mat inlier_mask;
+  //   int n_inliers = recoverPose(essential_matrix, points1, points2, K, R, t, inlier_mask);
+  //   // n_inliers: 参与光心前方检验并通过的点数, 可用来评估本次位姿恢复的可信度
+  //   // inlier_mask: 每个匹配点是否为内点(CV_8U), 可用于后续只保留可靠的三维点
+  //
+  // 注意: OpenCV 4 中 recoverPose 返回值类型为 int(内点个数), 而 OpenCV 3 中为 void;
+  //       两个版本都会对 4 组候选解做三角化 + 正深度检验, 选出唯一合理解。
   recoverPose(essential_matrix, points1, points2, R, t, focal_length, principal_point);
   cout << "R is " << endl << R << endl;
   cout << "t is " << endl << t << endl;

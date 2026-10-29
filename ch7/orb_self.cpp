@@ -46,6 +46,7 @@ int main(int argc, char **argv) {
   chrono::steady_clock::time_point t1 = chrono::steady_clock::now();
   vector<cv::KeyPoint> keypoints1;
   cv::FAST(first_image, keypoints1, 40);
+  cout << "keypoints in first image: " << keypoints1.size() << endl;
   vector<DescType> descriptor1;
   ComputeORB(first_image, keypoints1, descriptor1);
 
@@ -53,6 +54,7 @@ int main(int argc, char **argv) {
   vector<cv::KeyPoint> keypoints2;
   vector<DescType> descriptor2;
   cv::FAST(second_image, keypoints2, 40);
+  cout << "keypoints in second image: " << keypoints2.size() << endl;
   ComputeORB(second_image, keypoints2, descriptor2);
   chrono::steady_clock::time_point t2 = chrono::steady_clock::now();
   chrono::duration<double> time_used = chrono::duration_cast<chrono::duration<double>>(t2 - t1);

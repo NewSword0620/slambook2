@@ -251,33 +251,48 @@ void bundleAdjustment(
   const vector<Point3f> &pts1,
   const vector<Point3f> &pts2,
   Mat &R, Mat &t) {
-  // 构建图优化，先设定g2o
+  // g2o 的固定套路：
+  //   ① 选求解器组合（线性求解器 -> BlockSolver -> 迭代策略）注入 SparseOptimizer
+  //   ② 加顶点（待优化变量）
+  //   ③ 加边（误差项 + 观测 + 信息矩阵）
+  //   ④ initializeOptimization()
+  //   ⑤ optimize(次数)，再从顶点 estimate() 取结果
+
+  // ① 构建图优化，先设定g2o
+  // BlockSolverX = 顶点维度动态可变的 BlockSolver；若维度已知，可用 BlockSolverTraits<6,3>
   typedef g2o::BlockSolverX BlockSolverType;
   typedef g2o::LinearSolverDense<BlockSolverType::PoseMatrixType> LinearSolverType; // 线性求解器类型
-  // 梯度下降方法，可以从GN, LM, DogLeg 中选
+  // 梯度下降方法，可以从GN, LM, DogLeg 中选；这里用 LM（带阻尼，比纯 GN 稳）
   auto solver = new g2o::OptimizationAlgorithmLevenberg(
     std::make_unique<BlockSolverType>(std::make_unique<LinearSolverType>()));
-  g2o::SparseOptimizer optimizer;     // 图模型
+  g2o::SparseOptimizer optimizer;     // 图模型：内部存 vertices_ 与 edges_
   optimizer.setAlgorithm(solver);   // 设置求解器
   optimizer.setVerbose(true);       // 打开调试输出
 
-  // vertex
+  // ② vertex
   VertexPose *pose = new VertexPose(); // camera pose
-  pose->setId(0);
-  pose->setEstimate(Sophus::SE3d());
-  optimizer.addVertex(pose);
+  pose->setId(0);                      // 顶点 id 必须唯一，重复会被 addVertex 拒绝
+  pose->setEstimate(Sophus::SE3d());   // 初值置单位阵（只影响收敛路径，不影响最终解）
+  optimizer.addVertex(pose);           // optimizer 接管指针，析构时统一释放
 
-  // edges
+  // ③ edges：每个 3D-3D 匹配一条边，全部挂到同一个位姿顶点上
   for (size_t i = 0; i < pts1.size(); i++) {
+    // 构造参数存"被变换的点"，即第二帧下的 3D 坐标
     EdgeProjectXYZRGBDPoseOnly *edge = new EdgeProjectXYZRGBDPoseOnly(
       Eigen::Vector3d(pts2[i].x, pts2[i].y, pts2[i].z));
-    edge->setVertex(0, pose);
+    edge->setVertex(0, pose);                     // 一元边只有 0 号槽位
+    // 观测值：第一帧下同一点的 3D 坐标（即误差式子里的 z）
     edge->setMeasurement(Eigen::Vector3d(
       pts1[i].x, pts1[i].y, pts1[i].z));
+    // 信息矩阵 = 观测协方差的逆 = 该项权重；这里三轴等权(假设 sigma=1)。
+    // 必须显式设置：g2o 的基类不会初始化 _information，不设就是未定义值。
     edge->setInformation(Eigen::Matrix3d::Identity());
+    // 注：这里没有 setId，边的 id 只用于按 id 检索/删边，不设也能正常优化
     optimizer.addEdge(edge);
   }
 
+  // ④ initializeOptimization() 确定顶点/边结构与 H 的稀疏模式
+  // ⑤ optimize(10) 最多迭代 10 次，内部循环：computeError -> linearizeOplus -> 解 H*dx=-b -> oplus 更新
   chrono::steady_clock::time_point t1 = chrono::steady_clock::now();
   optimizer.initializeOptimization();
   optimizer.optimize(10);
@@ -286,8 +301,10 @@ void bundleAdjustment(
   cout << "optimization costs time: " << time_used.count() << " seconds." << endl;
 
   cout << endl << "after optimization:" << endl;
-  cout << "T=\n" << pose->estimate().matrix() << endl;
+  cout << "T=\n" << pose->estimate().matrix() << endl;   // 4x4 齐次矩阵形式
 
+  // 从顶点取回优化结果，转成 OpenCV 的 Mat 返回给调用者
+  // 得到的 R,t 满足 p1 = R * p2 + t，即"第二帧 -> 第一帧"的变换
   // convert to cv::Mat
   Eigen::Matrix3d R_ = pose->estimate().rotationMatrix();
   Eigen::Vector3d t_ = pose->estimate().translation();

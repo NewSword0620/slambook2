@@ -4,13 +4,13 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/calib3d/calib3d.hpp>
 #include <Eigen/Core>
-#include <g2o/core/base_vertex.h>
-#include <g2o/core/base_unary_edge.h>
-#include <g2o/core/sparse_optimizer.h>
-#include <g2o/core/block_solver.h>
-#include <g2o/core/solver.h>
-#include <g2o/core/optimization_algorithm_gauss_newton.h>
-#include <g2o/solvers/dense/linear_solver_dense.h>
+#include <g2o/core/base_vertex.h>                          // 顶点基类：图里的待优化变量
+#include <g2o/core/base_unary_edge.h>                      // 一元边基类：只连一个顶点的误差项
+#include <g2o/core/sparse_optimizer.h>                     // SparseOptimizer：整个图优化的"总管家"
+#include <g2o/core/block_solver.h>                         // BlockSolver：按顶点维度分块，把 H 拆成块
+#include <g2o/core/solver.h>                               // Solver 基类（线性求解器的接口）
+#include <g2o/core/optimization_algorithm_gauss_newton.h>  // 迭代策略：高斯牛顿（还可选 LM / DogLeg）
+#include <g2o/solvers/dense/linear_solver_dense.h>         // 线性求解器：稠密 Cholesky/LDLT 解 H*dx = -b
 #include <sophus/se3.hpp>
 #include <chrono>
 
@@ -104,6 +104,8 @@ int main(int argc, char **argv) {
   time_used = chrono::duration_cast<chrono::duration<double>>(t2 - t1);
   cout << "solve pnp by gauss newton cost time: " << time_used.count() << " seconds." << endl;
 
+  // 用 g2o 图优化再算一遍同样的最小二乘问题：输入同样是 (3D点, 2D像素, 内参)，输出优化后的位姿
+  // 与前面的 GN 手写版本数学上完全等价，区别只在于"边/顶点/雅可比"由框架统一调度
   cout << "calling bundle adjustment by g2o" << endl;
   Sophus::SE3d pose_g2o;
   t1 = chrono::steady_clock::now();
@@ -244,40 +246,60 @@ void bundleAdjustmentGaussNewton(
 }
 
 /// vertex and edges used in g2o ba
+/// ---------------------------------------------------------------------------
+/// 顶点：待优化的相机位姿。模板参数 <优化变量维度, 优化变量类型>
+/// 这里维度是 6（李代数 se3 的 3 旋转 + 3 平移），类型用 Sophus::SE3d 存
+/// 顶点必须实现两个纯虚函数：setToOriginImpl()（给初值/重置）和 oplusImpl()（增量更新）
+/// ---------------------------------------------------------------------------
 class VertexPose : public g2o::BaseVertex<6, Sophus::SE3d> {
 public:
+  // Sophus::SE3d 内部含 Eigen 定长对齐类型，需要 16 字节对齐的 operator new
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
 
+  // 初值：单位阵（表示"当前帧与参考帧重合"）。每轮优化前的 reset() 也会调它
   virtual void setToOriginImpl() override {
     _estimate = Sophus::SE3d();
   }
 
   /// left multiplication on SE3
+  /// SE3 是流形，不能直接 _estimate + update，必须在切空间上加完再指数映射回流形：
+  /// _estimate <- exp(dx) * _estimate，左乘表示增量作用在相机坐标系（右乘则是世界系）
+  /// update 是长度 6 的 double 数组，g2o 传入的是线性求解器解出来的 dx
   virtual void oplusImpl(const double *update) override {
     Eigen::Matrix<double, 6, 1> update_eigen;
     update_eigen << update[0], update[1], update[2], update[3], update[4], update[5];
     _estimate = Sophus::SE3d::exp(update_eigen) * _estimate;
   }
 
+  // 位姿顶点的磁盘读写，本程序不用，留空实现即可
   virtual bool read(istream &in) override {}
 
   virtual bool write(ostream &out) const override {}
 };
 
+/// ---------------------------------------------------------------------------
+/// 边：重投影误差。模板参数 <误差维度, 观测值类型, 关联顶点类型>
+/// 这是"一元边"（UnaryEdge），只连一个顶点（位姿），因为地图点在本问题里不是优化变量
+/// 若把地图点也作为顶点优化，就该用二元边 BaseBinaryEdge（完整 BA 的做法）
+/// ---------------------------------------------------------------------------
 class EdgeProjection : public g2o::BaseUnaryEdge<2, Eigen::Vector2d, VertexPose> {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
 
+  // 每个 3D-2D 匹配建一条边：把该点的 3D 坐标和内参存进边里（它们都是常数，不参与优化）
   EdgeProjection(const Eigen::Vector3d &pos, const Eigen::Matrix3d &K) : _pos3d(pos), _K(K) {}
 
+  // 计算误差 e = z - h(xi)：观测像素 _measurement 减去把 3D 点按当前位姿投影出来的像素
+  // h(xi) = K * (T * P) 再去齐次；_error 自动是 2x1
   virtual void computeError() override {
-    const VertexPose *v = static_cast<VertexPose *> (_vertices[0]);
+    const VertexPose *v = static_cast<VertexPose *> (_vertices[0]);  // _vertices 是 g2o 自动维护的顶点指针数组
     Sophus::SE3d T = v->estimate();
     Eigen::Vector3d pos_pixel = _K * (T * _pos3d);
     pos_pixel /= pos_pixel[2];
     _error = _measurement - pos_pixel.head<2>();
   }
 
+  // 手动提供解析雅可比 de/dxi（2x6，相对于左乘扰动）：不实现则 g2o 退化为数值求导，慢且精度差
   virtual void linearizeOplus() override {
     const VertexPose *v = static_cast<VertexPose *> (_vertices[0]);
     Sophus::SE3d T = v->estimate();
@@ -310,43 +332,55 @@ void bundleAdjustmentG2O(
   const Mat &K,
   Sophus::SE3d &pose) {
 
-  // 构建图优化，先设定g2o
+  // g2o 使用套路固定为五步：
+  //   ① 选求解器组合（线性求解器 → BlockSolver → 迭代策略）注入 SparseOptimizer
+  //   ② 加顶点（待优化变量）
+  //   ③ 加边（误差项），每条边指定关联顶点、观测值、信息矩阵
+  //   ④ initializeOptimization()
+  //   ⑤ optimize(迭代次数) 后从顶点 estimate() 取结果
+
+  // ① 构建图优化，先设定g2o
+  // BlockSolverTraits<6, 3>：位姿顶点维度 6，路标(landmark)维度 3，g2o 据此把 H 分块
   typedef g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>> BlockSolverType;  // pose is 6, landmark is 3
+  // 线性求解器：稠密 LDLT/Cholesky。问题规模大时应换成 CSparse / Cholmod 等稀疏求解器
   typedef g2o::LinearSolverDense<BlockSolverType::PoseMatrixType> LinearSolverType; // 线性求解器类型
-  // 梯度下降方法，可以从GN, LM, DogLeg 中选
+  // 梯度下降方法，可以从GN, LM, DogLeg 中选；这里与手写版本保持一致用 GN
+  // 注意 std::make_unique 要求 C++14，且底层指针交给 solver 托管，不用自己 delete
   auto solver = new g2o::OptimizationAlgorithmGaussNewton(
     std::make_unique<BlockSolverType>(std::make_unique<LinearSolverType>()));
-  g2o::SparseOptimizer optimizer;     // 图模型
+  g2o::SparseOptimizer optimizer;     // 图模型：内部存 vertices_ 和 edges_
   optimizer.setAlgorithm(solver);   // 设置求解器
   optimizer.setVerbose(true);       // 打开调试输出
 
-  // vertex
+  // ② vertex
   VertexPose *vertex_pose = new VertexPose(); // camera vertex_pose
-  vertex_pose->setId(0);
-  vertex_pose->setEstimate(Sophus::SE3d());
-  optimizer.addVertex(vertex_pose);
+  vertex_pose->setId(0);                      // 顶点编号必须唯一，优化器靠 id 找顶点
+  vertex_pose->setEstimate(Sophus::SE3d());   // 初值置单位阵（与 GN 版一致）
+  optimizer.addVertex(vertex_pose);           // optimizer 接管指针，结束后统一释放
 
-  // K
+  // K：OpenCV 的 Mat 转成 Eigen 矩阵，方便在边里做乘法
   Eigen::Matrix3d K_eigen;
   K_eigen <<
           K.at<double>(0, 0), K.at<double>(0, 1), K.at<double>(0, 2),
     K.at<double>(1, 0), K.at<double>(1, 1), K.at<double>(1, 2),
     K.at<double>(2, 0), K.at<double>(2, 1), K.at<double>(2, 2);
 
-  // edges
-  int index = 1;
+  // ③ edges：每个 3D-2D 匹配一条边，N 个点就是 N 条边，全部挂在同一个位姿顶点上
+  int index = 1;                       // 边 id 从 1 开始，0 留给顶点（边 id 也必须唯一）
   for (size_t i = 0; i < points_2d.size(); ++i) {
     auto p2d = points_2d[i];
     auto p3d = points_3d[i];
     EdgeProjection *edge = new EdgeProjection(p3d, K_eigen);
     edge->setId(index);
-    edge->setVertex(0, vertex_pose);
-    edge->setMeasurement(p2d);
-    edge->setInformation(Eigen::Matrix2d::Identity());
+    edge->setVertex(0, vertex_pose);                        // 0 号顶点（一元边只有 0 号槽位）
+    edge->setMeasurement(p2d);                              // 观测值 z：第二帧的像素坐标
+    edge->setInformation(Eigen::Matrix2d::Identity());      // 信息矩阵 = 协方差逆，这里假设各向同性等权
     optimizer.addEdge(edge);
     index++;
   }
 
+  // ④ ⑤ 初始化并迭代：initializeOptimization() 按边把顶点/边的结构确定下来（建立 H 的稀疏结构）
+  // optimize(10) 即最多迭代 10 次，内部流程：computeError → linearizeOplus → 解 H*dx=b → oplus 更新
   chrono::steady_clock::time_point t1 = chrono::steady_clock::now();
   optimizer.setVerbose(true);
   optimizer.initializeOptimization();
@@ -354,6 +388,7 @@ void bundleAdjustmentG2O(
   chrono::steady_clock::time_point t2 = chrono::steady_clock::now();
   chrono::duration<double> time_used = chrono::duration_cast<chrono::duration<double>>(t2 - t1);
   cout << "optimization costs time: " << time_used.count() << " seconds." << endl;
+  // 从顶点取出优化结果，并回传给调用者
   cout << "pose estimated by g2o =\n" << vertex_pose->estimate().matrix() << endl;
   pose = vertex_pose->estimate();
 }
